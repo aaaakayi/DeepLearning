@@ -24,4 +24,4 @@ Y_clone = clone(X)
 print(Y == Y_clone)
 
 x = tf.constant([1, 2, 3])
-print(x.device
+print(x.device)

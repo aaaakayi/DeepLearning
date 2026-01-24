@@ -84,7 +84,7 @@ if __name__ == '__main__':
 
     # 建立字典
     vocab = Vocab(token)
+    #打印前10个频率最高的词汇
     print(list(vocab.token_to_idx.items())[:10])
-
     #预处理标准流程：数据导入列表 -> 词元化 -> 建立字典映射
 
