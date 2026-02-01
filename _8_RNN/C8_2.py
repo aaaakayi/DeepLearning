@@ -71,12 +71,21 @@ def count_corpus(tokens):  #@save
         tokens = [token for line in tokens for token in line]
     return collections.Counter(tokens)
 
+def get_vocab():
+    str = 'timemachine.txt'
+    lines = read_txt_to_lines(str)
 
+    # 词元(token)化
+    token = tokenize(lines, token='word')
+
+    # 建立字典
+    vocab = Vocab(token)
+    return vocab
 
 
 if __name__ == '__main__':
     #先把数据一行一行的导入一个列表中,同时清理数据只留下小写字母
-    str = 'timemachine.txt'
+    str = r'C:/Users/Aumu/PycharmProjects/DeepLearning/_8_RNN/timemachine.txt'
     lines = read_txt_to_lines(str)
 
     # 词元(token)化
