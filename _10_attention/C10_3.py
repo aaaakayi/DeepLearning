@@ -12,37 +12,157 @@ import torch.nn.functional as F
 import numpy as np
 from  C10_1 import show_heatmap,show_multiple_heatmaps
 
-def mask_softmax(x,valid_lens,mask=None):
+import torch
+import torch.nn.functional as F
+
+
+def mask_softmax(x, valid_lens=None, mask=None):
     """
+    实现Masked Softmax，支持各种形状的掩码
 
-    :param x: 注意力分数张量，形状为 [batch_size, seq_len, seq_len]
-    :param valid_lens: 有效范围
-    :param mask: 掩蔽矩阵
-    :return: 裁剪后进行softmax的值
+    参数:
+    x: 注意力分数张量，形状为 [batch_size * num_heads, num_queries, num_keys]
+        注意：在多头注意力中，x已经是重塑后的形状，batch维度已包含num_heads
+    valid_lens: 有效长度，用于创建填充掩码，形状为 (batch_size,) 或 (batch_size, num_queries)
+    mask: 外部传入的掩码，形状可以是：
+          - 2D: (num_queries, num_keys)
+          - 3D: (batch_size, num_queries, num_keys)
+          - 4D: (batch_size, 1, 1, num_keys) 或 (batch_size, 1, num_queries, num_keys)
+
+    返回:
+    裁剪后进行softmax的值，形状与x相同
     """
-    batch_size, seq_len, _ = x.shape
+    # x的形状：在MultiHeadAttention中，x已经是(batch_size * num_heads, num_queries, num_keys)
+    # 我们需要通过mask的batch_size来推断num_heads
+    batch_size_num_heads, num_queries, num_keys = x.shape
 
-    # 步骤1: 创建掩码矩阵
-    # 使用torch.arange创建位置索引 [0, 1, 2, 3, ...]
-    positions = torch.arange(seq_len, device=x.device)  # [seq_len]
+    # 处理外部传入的掩码
+    if mask is not None:
+        # 记录原始掩码形状
+        original_mask_shape = mask.shape
 
-    # 将valid_lens扩展为适合广播的形状
-    # 原始: [batch_size] -> 扩展为: [batch_size, 1, seq_len]
-    valid_lens_expanded = valid_lens.view(-1, 1, 1)  # [batch_size, 1, 1]
-    positions_expanded = positions.view(1, 1, -1)  # [1, 1, seq_len]
+        # 情况1：4维掩码 (从create_masks返回)
+        if mask.dim() == 4:
+            batch_size = mask.shape[0]  # 原始batch_size
+            num_heads = batch_size_num_heads // batch_size
 
-    # 步骤2: 生成掩码 (True表示保留，False表示屏蔽)
-    # 比较位置索引和有效长度，创建布尔掩码
-    mask = positions_expanded < valid_lens_expanded  # [batch_size, 1, seq_len]
+            # 确保能整除
+            if batch_size_num_heads % batch_size != 0:
+                raise ValueError(
+                    f"掩码的batch_size={batch_size}无法整除x的batch_size={batch_size_num_heads}"
+                )
 
-    # 扩展掩码维度以匹配x的形状 [batch_size, seq_len, seq_len]
-    mask = mask.expand(-1, seq_len, -1)
+            # 子情况1.1: (batch_size, 1, 1, num_keys) -> 用于编码器或编码器-解码器注意力
+            if mask.shape[1] == 1 and mask.shape[2] == 1:
+                # 扩展掩码：(batch_size, 1, 1, num_keys) -> (batch_size, num_heads, num_queries, num_keys)
+                mask = mask.expand(-1, num_heads, num_queries, -1)
+                # 重塑：(batch_size, num_heads, num_queries, num_keys) -> (batch_size * num_heads, num_queries, num_keys)
+                mask = mask.reshape(batch_size_num_heads, num_queries, num_keys)
 
-    # 步骤3: 应用掩码到注意力分数
-    # 将被屏蔽的位置填充为负无穷
-    x_masked = x.masked_fill(~mask, -1e9)  # 使用 -1e9 近似负无穷
+            # 子情况1.2: (batch_size, 1, num_queries, num_keys) -> 用于解码器自注意力
+            elif mask.shape[1] == 1:
+                # 扩展掩码：(batch_size, 1, num_queries, num_keys) -> (batch_size, num_heads, num_queries, num_keys)
+                mask = mask.expand(-1, num_heads, -1, -1)
+                # 重塑
+                mask = mask.reshape(batch_size_num_heads, num_queries, num_keys)
 
-    # 步骤4: 应用softmax
+            # 子情况1.3: (batch_size, num_queries, num_queries, num_keys) -> 不常见，但处理一下
+            elif mask.shape[2] == num_queries:
+                # 假设num_queries = num_keys
+                mask = mask.squeeze(1) if mask.shape[1] == 1 else mask
+                if mask.dim() == 4:
+                    # 压缩到3D
+                    mask = mask.mean(dim=1)  # 或者其他聚合方式
+                mask = mask.expand(-1, num_heads, -1, -1).reshape(batch_size_num_heads, num_queries, num_keys)
+
+        # 情况2：3维掩码 (batch_size, num_queries, num_keys)
+        elif mask.dim() == 3:
+            batch_size = mask.shape[0]
+            num_heads = batch_size_num_heads // batch_size
+
+            if batch_size_num_heads % batch_size == 0:
+                # 扩展掩码到多头
+                mask = mask.unsqueeze(1).expand(-1, num_heads, -1, -1)
+                mask = mask.reshape(batch_size_num_heads, num_queries, num_keys)
+            else:
+                # 如果不能整除，假设mask已经是正确的形状
+                if mask.shape != x.shape:
+                    # 尝试广播
+                    try:
+                        mask = mask.expand_as(x)
+                    except:
+                        raise ValueError(
+                            f"3D掩码形状{mask.shape}无法广播到x形状{x.shape}，且batch_size不匹配"
+                        )
+
+        # 情况3：2维掩码 (num_queries, num_keys)
+        elif mask.dim() == 2:
+            # 直接扩展到需要的形状
+            mask = mask.unsqueeze(0).expand(batch_size_num_heads, -1, -1)
+
+        else:
+            raise ValueError(f"不支持的掩码维度: {mask.dim()}")
+
+    # 初始化最终掩码
+    final_mask = torch.zeros_like(x, dtype=torch.bool, device=x.device)
+
+    # 添加外部掩码（如果有）
+    if mask is not None:
+        # 确保掩码形状匹配
+        if mask.shape != x.shape:
+            try:
+                mask = mask.expand_as(x)
+            except RuntimeError:
+                raise ValueError(f"掩码形状{mask.shape}无法广播到x形状{x.shape}")
+
+        # 注意：我们的掩码是True表示要屏蔽
+        final_mask = final_mask | mask
+
+    # 添加填充掩码（如果有valid_lens）
+    if valid_lens is not None:
+        # 确定batch_size
+        if mask is not None and mask.dim() >= 3:
+            # 从掩码推断batch_size
+            batch_size = mask.shape[0] if mask.dim() == 3 else mask.shape[0]
+        else:
+            # 从x推断：假设x的第一维是batch_size * num_heads
+            # 我们需要知道num_heads才能知道batch_size
+            # 这里我们假设num_heads=1，或者使用有效长度推断
+            batch_size = batch_size_num_heads
+
+        # 确保valid_lens的形状正确
+        if valid_lens.dim() == 1:
+            # (batch_size,) -> (batch_size, 1, 1)
+            valid_lens = valid_lens.view(-1, 1, 1)
+            # 扩展到每个查询
+            valid_lens = valid_lens.expand(-1, num_queries, 1)
+        elif valid_lens.dim() == 2:
+            # (batch_size, num_queries) -> (batch_size, num_queries, 1)
+            valid_lens = valid_lens.unsqueeze(-1)
+
+        # 创建位置索引
+        positions = torch.arange(num_keys, device=x.device)
+        positions = positions.view(1, 1, -1).expand(batch_size, num_queries, -1)
+
+        # 创建填充掩码：位置 >= 有效长度的位置应该被屏蔽
+        # 注意：valid_lens需要扩展到num_keys维度
+        padding_mask = positions >= valid_lens.expand(-1, -1, num_keys)
+
+        # 扩展填充掩码到多头（如果需要）
+        if padding_mask.shape[0] < batch_size_num_heads:
+            # 计算num_heads
+            num_heads = batch_size_num_heads // padding_mask.shape[0]
+            if batch_size_num_heads % padding_mask.shape[0] == 0:
+                padding_mask = padding_mask.unsqueeze(1).expand(-1, num_heads, -1, -1)
+                padding_mask = padding_mask.reshape(batch_size_num_heads, num_queries, num_keys)
+
+        # 合并掩码
+        final_mask = final_mask | padding_mask
+
+    # 应用掩码：将被屏蔽的位置设置为负无穷
+    x_masked = x.masked_fill(final_mask, -1e9)
+
+    # 应用softmax
     result = F.softmax(x_masked, dim=-1)
 
     return result
@@ -63,7 +183,7 @@ class additive_attention(nn.Module):
         self.W_v = nn.Linear(in_features=num_hiddens,out_features=1,bias=False)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self,queries, keys, values, valid_lens,mask_softmax):
+    def forward(self,queries, keys, values, valid_lens, mask):
         #将查询与键的特征维度通过稠密层投射到同一维度
         queries = self.W_q(queries)
         keys = self.W_k(keys)
@@ -72,7 +192,7 @@ class additive_attention(nn.Module):
         features = torch.tanh(queries.unsqueeze(2) + keys.unsqueeze(1))
 
         scores = self.W_v(features).squeeze(-1)
-        self.attention_weights = mask_softmax(scores, valid_lens)
+        self.attention_weights = mask_softmax(scores, valid_lens, mask)
         # values的形状：(batch_size，“键－值”对的个数，值的维度)
         return torch.bmm(self.dropout(self.attention_weights), values) , self.attention_weights
 class DotProductAttention(nn.Module):
@@ -89,12 +209,12 @@ class DotProductAttention(nn.Module):
     # keys的形状：(batch_size，“键－值”对的个数，d)
     # values的形状：(batch_size，“键－值”对的个数，值的维度)
     # valid_lens的形状:(batch_size，)或者(batch_size，查询的个数)
-    def forward(self, queries, keys, values, mask_softmax, valid_lens=None):
+    def forward(self, queries, keys, values, mask=None, valid_lens=None):
         d = queries.shape[-1]
         # 设置transpose_b=True为了交换keys的最后两个维度
         scores = torch.bmm(queries, keys.transpose(1,2)) / math.sqrt(d)
-        self.attention_weights = mask_softmax(scores, valid_lens)
-        return torch.bmm(self.dropout(self.attention_weights), values),self.attention_weights
+        self.attention_weights = mask_softmax(scores, valid_lens = valid_lens, mask = mask)
+        return torch.bmm(self.dropout(self.attention_weights), values), self.attention_weights
 
 
 if __name__ == '__main__':
@@ -125,7 +245,7 @@ if __name__ == '__main__':
             keys=keys,
             values=values,
             valid_lens=valid_lens,
-            mask_softmax = mask_softmax
+            mask = None
         )
 
     print("输出形状:", output.shape)
@@ -153,7 +273,7 @@ if __name__ == '__main__':
             keys=keys,
             values=values,
             valid_lens=valid_lens,
-            mask_softmax=mask_softmax
+            mask = None
         )
 
     print("输出形状:", output.shape)
